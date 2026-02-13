@@ -83,6 +83,18 @@ def run_pipeline(
     return pipeline.run(data_inicio=data_inicio, data_fim=data_fim)
 
 
+@app.post("/run/full")
+def run_full_pipeline(
+    data_inicio: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    data_fim: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    db: Session = Depends(get_db),
+):
+    if not data_fim:
+        data_fim = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pipeline = Pipeline(db)
+    return pipeline.run_full(data_inicio=data_inicio, data_fim=data_fim)
+
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 

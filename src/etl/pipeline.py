@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,27 @@ def _safe_get(data, *keys, default=None):
         if current is None:
             return default
     return current
+
+
+def _gerar_periodos_mensais(data_inicio: str, data_fim: str) -> list[tuple[str, str]]:
+    """Quebra um range de datas em períodos mensais."""
+    inicio = date.fromisoformat(data_inicio)
+    fim = date.fromisoformat(data_fim)
+    periodos = []
+
+    cursor = inicio
+    while cursor <= fim:
+        # Último dia do mês corrente
+        if cursor.month == 12:
+            fim_mes = date(cursor.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            fim_mes = date(cursor.year, cursor.month + 1, 1) - timedelta(days=1)
+
+        periodo_fim = min(fim_mes, fim)
+        periodos.append((cursor.isoformat(), periodo_fim.isoformat()))
+        cursor = periodo_fim + timedelta(days=1)
+
+    return periodos
 
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
@@ -135,6 +156,64 @@ class Pipeline:
             )
             return {"status": "error", "stats": self.stats, "run_id": run_id}
 
+    def run_full(
+        self,
+        data_inicio: str,
+        data_fim: str,
+    ) -> dict:
+        """Extração completa quebrando em períodos mensais."""
+        now = datetime.now(timezone.utc)
+        run_id = create_etl_run(self.db, now.date())
+
+        try:
+            logger.info("Renovando token OAuth...")
+            access_token = refresh_access_token(self.db)
+
+            # Gerar períodos mensais
+            periodos = _gerar_periodos_mensais(data_inicio, data_fim)
+            logger.info(
+                "Extração completa: %s a %s (%d períodos)",
+                data_inicio, data_fim, len(periodos),
+            )
+
+            todas_nfes = []
+            with BlingClient(access_token) as client:
+                for i, (ini, fim) in enumerate(periodos, 1):
+                    logger.info(
+                        "=== Período %d/%d: %s a %s ===",
+                        i, len(periodos), ini, fim,
+                    )
+                    nfes = self._extrair_nfes(client, ini, fim)
+                    todas_nfes.extend(nfes)
+                    self.db.commit()
+
+                # Contatos e Produtos sobre todas as NF-e coletadas
+                self._extrair_contatos(client, todas_nfes)
+                self._extrair_produtos(client, todas_nfes)
+
+            self.db.commit()
+            finish_etl_run(
+                self.db, run_id, status="success",
+                nfes=self.stats["nfes"],
+                contatos=self.stats["contatos"],
+                produtos=self.stats["produtos"],
+            )
+            logger.info("Extração completa finalizada: %s", self.stats)
+            return {"status": "success", "stats": self.stats, "run_id": run_id}
+
+        except Exception as e:
+            self.db.rollback()
+            erro_msg = f"{type(e).__name__}: {e}"
+            logger.error("Extração completa falhou: %s", erro_msg)
+            finish_etl_run(
+                self.db, run_id, status="error",
+                nfes=self.stats["nfes"],
+                contatos=self.stats["contatos"],
+                produtos=self.stats["produtos"],
+                erro=erro_msg,
+            )
+            return {"status": "error", "stats": self.stats, "run_id": run_id}
+
     # ── Etapa NF-e ───────────────────────────────────────────────────────
 
     def _extrair_nfes(
@@ -174,11 +253,13 @@ class Pipeline:
         nfe_id = resumo["id"]
         contato = resumo.get("contato", {}) or {}
         endereco = contato.get("endereco", {}) or {}
+        dados = detalhe.get("data", {}) or {}
 
-        # Totais do XML
-        icms_tot = _safe_get(
-            detalhe, "data", "xml", "nfeProc", "NFe", "infNFe", "total", "ICMSTot"
-        )
+        # Totais vêm direto do detalhe
+        valor_nota = _to_float(dados.get("valorNota"))
+        # Somar valorTotal dos itens para total_produtos
+        itens_raw = dados.get("itens", []) or []
+        total_produtos = sum(_to_float(it.get("valorTotal")) for it in itens_raw)
 
         cabecalho = {
             "id": nfe_id,
@@ -190,44 +271,34 @@ class Pipeline:
             "contato_documento": contato.get("numeroDocumento"),
             "contato_municipio": endereco.get("municipio"),
             "contato_uf": endereco.get("uf"),
-            "total_produtos": _to_float(_safe_get(icms_tot, "vProd")) if icms_tot else 0,
-            "total_nota": _to_float(_safe_get(icms_tot, "vNF")) if icms_tot else 0,
-            "total_descontos": _to_float(_safe_get(icms_tot, "vDesc")) if icms_tot else 0,
+            "total_produtos": total_produtos,
+            "total_nota": valor_nota,
+            "total_descontos": total_produtos - valor_nota if total_produtos > valor_nota else 0,
         }
         upsert_nfe_cabecalho(self.db, cabecalho)
 
-        # Itens do XML
-        det_raw = _safe_get(
-            detalhe, "data", "xml", "nfeProc", "NFe", "infNFe", "det"
-        )
+        # Itens vêm de data.itens[]
         itens = []
-        if det_raw:
-            det_list = det_raw if isinstance(det_raw, list) else [det_raw]
-            for det in det_list:
-                prod = det.get("prod", {}) or {}
-                itens.append({
-                    "codigo_produto": prod.get("cProd"),
-                    "descricao_produto": prod.get("xProd"),
-                    "quantidade": _to_float(prod.get("qCom")),
-                    "valor_unitario": _to_float(prod.get("vUnCom")),
-                    "valor_total": _to_float(prod.get("vProd")),
-                    "valor_desconto": _to_float(prod.get("vDesc")),
-                    "unidade_medida": prod.get("uCom"),
-                })
+        for it in itens_raw:
+            itens.append({
+                "codigo_produto": it.get("codigo"),
+                "descricao_produto": it.get("descricao"),
+                "quantidade": _to_float(it.get("quantidade")),
+                "valor_unitario": _to_float(it.get("valor")),
+                "valor_total": _to_float(it.get("valorTotal")),
+                "valor_desconto": 0,
+                "unidade_medida": it.get("unidade"),
+            })
         upsert_nfe_itens(self.db, nfe_id, itens)
 
-        # Pagamentos do XML
-        det_pag_raw = _safe_get(
-            detalhe, "data", "xml", "nfeProc", "NFe", "infNFe", "pag", "detPag"
-        )
+        # Pagamentos vêm de data.parcelas[]
+        parcelas_raw = dados.get("parcelas", []) or []
         pagamentos = []
-        if det_pag_raw:
-            pag_list = det_pag_raw if isinstance(det_pag_raw, list) else [det_pag_raw]
-            for pag in pag_list:
-                pagamentos.append({
-                    "tipo_pagamento": _to_int(pag.get("tPag")),
-                    "valor": _to_float(pag.get("vPag")),
-                })
+        for parc in parcelas_raw:
+            pagamentos.append({
+                "tipo_pagamento": _to_int(parc.get("formaPagamento", {}).get("id")),
+                "valor": _to_float(parc.get("valor")),
+            })
         upsert_nfe_pagamentos(self.db, nfe_id, pagamentos)
 
     # ── Etapa Contatos ───────────────────────────────────────────────────
@@ -255,7 +326,7 @@ class Pipeline:
             try:
                 resp = client.buscar_contato(contato_id)
                 data = resp.get("data", {}) or {}
-                endereco = _safe_get(data, "endereco") or {}
+                endereco_geral = _safe_get(data, "endereco", "geral") or {}
 
                 upsert_contato(self.db, {
                     "id": contato_id,
@@ -263,8 +334,8 @@ class Pipeline:
                     "documento": data.get("numeroDocumento"),
                     "email": data.get("email"),
                     "tipo_pessoa": data.get("tipo"),
-                    "municipio": endereco.get("municipio"),
-                    "uf": endereco.get("uf"),
+                    "municipio": endereco_geral.get("municipio"),
+                    "uf": endereco_geral.get("uf"),
                 })
                 self.stats["contatos"] += 1
             except Exception:
@@ -282,14 +353,9 @@ class Pipeline:
         # Coletar códigos de produtos dos itens das NF-e
         codigos_nfe = set()
         for nfe in nfes:
-            det_raw = _safe_get(
-                nfe, "data", "xml", "nfeProc", "NFe", "infNFe", "det"
-            )
-            if not det_raw:
-                continue
-            det_list = det_raw if isinstance(det_raw, list) else [det_raw]
-            for det in det_list:
-                codigo = _safe_get(det, "prod", "cProd")
+            itens = _safe_get(nfe, "data", "itens") or []
+            for it in itens:
+                codigo = it.get("codigo")
                 if codigo:
                     codigos_nfe.add(str(codigo))
 
@@ -310,12 +376,13 @@ class Pipeline:
                     continue
 
                 categoria = produto.get("categoria", {}) or {}
+                fornecedor = produto.get("fornecedor", {}) or {}
                 upsert_produto(self.db, {
                     "id": produto["id"],
                     "codigo": codigo,
                     "nome": produto.get("nome"),
                     "preco_venda": _to_float(produto.get("preco")),
-                    "preco_custo": _to_float(produto.get("precoCusto")),
+                    "preco_custo": _to_float(fornecedor.get("precoCusto")),
                     "categoria_id": _to_int(categoria.get("id")),
                     "categoria_descricao": categoria.get("descricao"),
                 })
