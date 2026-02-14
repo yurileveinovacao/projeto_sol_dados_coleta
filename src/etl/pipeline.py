@@ -241,6 +241,7 @@ class Pipeline:
                     logger.info("Checkpoint: %d NF-es salvas", self.stats["nfes"])
 
             except Exception:
+                self.db.rollback()
                 logger.error("Erro ao processar NF-e id=%s", nfe_id, exc_info=True)
 
             if i % 100 == 0:
@@ -339,6 +340,7 @@ class Pipeline:
                 })
                 self.stats["contatos"] += 1
             except Exception:
+                self.db.rollback()
                 logger.error(
                     "Erro ao buscar contato id=%d", contato_id, exc_info=True
                 )
@@ -388,6 +390,7 @@ class Pipeline:
                 })
                 self.stats["produtos"] += 1
             except Exception:
+                self.db.rollback()
                 logger.error(
                     "Erro ao buscar produto código=%s", codigo, exc_info=True
                 )
