@@ -9,10 +9,14 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      id-token: write
+
     env:
-      PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      PROJECT_ID: sol-engrenagens
       SERVICE_NAME: sol-bling-collector
-      REGION: southamerica-east1
+      REGION: us-central1
 
     steps:
       - name: Checkout
@@ -21,7 +25,8 @@ jobs:
       - name: Auth GCP
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: projects/838831242440/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-actions-sa@sol-engrenagens.iam.gserviceaccount.com
 
       - name: Setup Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
@@ -43,9 +48,14 @@ jobs:
             --region $REGION \
             --platform managed \
             --no-allow-unauthenticated \
-            --set-env-vars "BLING_CLIENT_ID=${{ secrets.BLING_CLIENT_ID }}" \
-            --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }}" \
+            --service-account sol-cloudrun-sa@$PROJECT_ID.iam.gserviceaccount.com \
+            --add-cloudsql-instances sol-engrenagens:us-central1:sol-postgres \
+            --set-secrets "BLING_CLIENT_ID=bling-client-id:latest" \
             --set-secrets "BLING_CLIENT_SECRET=bling-client-secret:latest" \
+            --set-secrets "DATABASE_URL=database-url:latest" \
             --memory 512Mi \
+            --cpu 1 \
             --timeout 900 \
-            --max-instances 1
+            --max-instances 1 \
+            --min-instances 0 \
+            --concurrency 1
