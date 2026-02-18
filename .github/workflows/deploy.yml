@@ -34,17 +34,17 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - name: Configure Docker
-        run: gcloud auth configure-docker
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
 
       - name: Build and Push
         run: |
-          docker build -t gcr.io/$PROJECT_ID/$SERVICE_NAME:${{ github.sha }} .
-          docker push gcr.io/$PROJECT_ID/$SERVICE_NAME:${{ github.sha }}
+          docker build -t us-central1-docker.pkg.dev/$PROJECT_ID/sol-docker/$SERVICE_NAME:${{ github.sha }} .
+          docker push us-central1-docker.pkg.dev/$PROJECT_ID/sol-docker/$SERVICE_NAME:${{ github.sha }}
 
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy $SERVICE_NAME \
-            --image gcr.io/$PROJECT_ID/$SERVICE_NAME:${{ github.sha }} \
+            --image us-central1-docker.pkg.dev/$PROJECT_ID/sol-docker/$SERVICE_NAME:${{ github.sha }} \
             --region $REGION \
             --platform managed \
             --no-allow-unauthenticated \
