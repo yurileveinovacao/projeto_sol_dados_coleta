@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from src.api.bling_client import BlingClient
-from src.auth.oauth import refresh_access_token
+from src.auth.oauth import get_valid_access_token
 from src.config import get_settings
 from src.db.repository import (
     create_etl_run,
@@ -111,8 +111,8 @@ class Pipeline:
 
         try:
             # 3. Refresh do token OAuth
-            logger.info("Renovando token OAuth...")
-            access_token = refresh_access_token(self.db)
+            logger.info("Obtendo token OAuth...")
+            access_token = get_valid_access_token(self.db)
 
             # 4. Criar client
             with BlingClient(access_token) as client:
@@ -166,8 +166,8 @@ class Pipeline:
         run_id = create_etl_run(self.db, now.date())
 
         try:
-            logger.info("Renovando token OAuth...")
-            access_token = refresh_access_token(self.db)
+            logger.info("Obtendo token OAuth...")
+            access_token = get_valid_access_token(self.db)
 
             # Gerar períodos mensais
             periodos = _gerar_periodos_mensais(data_inicio, data_fim)
