@@ -231,7 +231,8 @@ class Pipeline:
             nfe_id = resumo.get("id")
             try:
                 detalhe = client.detalhar_nfe(nfe_id)
-                self._salvar_nfe(resumo, detalhe)
+                with self.db.begin_nested():  # SAVEPOINT por NF-e
+                    self._salvar_nfe(resumo, detalhe)
                 nfes_detalhadas.append(detalhe)
                 self.stats["nfes"] += 1
 
@@ -241,7 +242,6 @@ class Pipeline:
                     logger.info("Checkpoint: %d NF-es salvas", self.stats["nfes"])
 
             except Exception:
-                self.db.rollback()
                 logger.error("Erro ao processar NF-e id=%s", nfe_id, exc_info=True)
 
             if i % 100 == 0:
@@ -329,18 +329,18 @@ class Pipeline:
                 data = resp.get("data", {}) or {}
                 endereco_geral = _safe_get(data, "endereco", "geral") or {}
 
-                upsert_contato(self.db, {
-                    "id": contato_id,
-                    "nome": data.get("nome"),
-                    "documento": data.get("numeroDocumento"),
-                    "email": data.get("email"),
-                    "tipo_pessoa": data.get("tipo"),
-                    "municipio": endereco_geral.get("municipio"),
-                    "uf": endereco_geral.get("uf"),
-                })
+                with self.db.begin_nested():  # SAVEPOINT por contato
+                    upsert_contato(self.db, {
+                        "id": contato_id,
+                        "nome": data.get("nome"),
+                        "documento": data.get("numeroDocumento"),
+                        "email": data.get("email"),
+                        "tipo_pessoa": data.get("tipo"),
+                        "municipio": endereco_geral.get("municipio"),
+                        "uf": endereco_geral.get("uf"),
+                    })
                 self.stats["contatos"] += 1
             except Exception:
-                self.db.rollback()
                 logger.error(
                     "Erro ao buscar contato id=%d", contato_id, exc_info=True
                 )
@@ -379,18 +379,18 @@ class Pipeline:
 
                 categoria = produto.get("categoria", {}) or {}
                 fornecedor = produto.get("fornecedor", {}) or {}
-                upsert_produto(self.db, {
-                    "id": produto["id"],
-                    "codigo": codigo,
-                    "nome": produto.get("nome"),
-                    "preco_venda": _to_float(produto.get("preco")),
-                    "preco_custo": _to_float(fornecedor.get("precoCusto")),
-                    "categoria_id": _to_int(categoria.get("id")),
-                    "categoria_descricao": categoria.get("descricao"),
-                })
+                with self.db.begin_nested():  # SAVEPOINT por produto
+                    upsert_produto(self.db, {
+                        "id": produto["id"],
+                        "codigo": codigo,
+                        "nome": produto.get("nome"),
+                        "preco_venda": _to_float(produto.get("preco")),
+                        "preco_custo": _to_float(fornecedor.get("precoCusto")),
+                        "categoria_id": _to_int(categoria.get("id")),
+                        "categoria_descricao": categoria.get("descricao"),
+                    })
                 self.stats["produtos"] += 1
             except Exception:
-                self.db.rollback()
                 logger.error(
                     "Erro ao buscar produto código=%s", codigo, exc_info=True
                 )
