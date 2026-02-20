@@ -151,16 +151,18 @@ Navegador                   App (first_auth.py)              Bling OAuth
     |                              |---> PostgreSQL                |
 ```
 
-### Fluxo de refresh (automatico a cada execucao)
+### Fluxo de refresh (inteligente)
 
 ```python
-# src/auth/oauth.py — refresh_access_token()
+# src/auth/oauth.py — get_valid_access_token()
 
 1. Busca token atual do banco (tabela oauth_tokens, id=1)
-2. POST /oauth/token com grant_type=refresh_token
-3. Bling retorna novo access_token + novo refresh_token
-4. CRITICO: salva imediatamente no banco (o refresh_token antigo ja foi invalidado)
-5. Retorna o novo access_token para o pipeline
+2. Verifica se faltam menos de 10 minutos para expirar
+3. Se ainda valido: retorna o access_token atual (sem refresh)
+4. Se expirando: POST /oauth/token com grant_type=refresh_token
+5. Bling retorna novo access_token + novo refresh_token
+6. CRITICO: salva imediatamente no banco (o refresh_token antigo ja foi invalidado)
+7. Retorna o novo access_token para o pipeline
 ```
 
 **Pontos importantes:**
@@ -228,11 +230,12 @@ Para carga historica. Recebe `data_inicio` e `data_fim` obrigatorios.
 
 ### Tratamento de erros
 
-- **Erro individual por NF-e/contato/produto**: rollback parcial, log do erro, continua processando
+- **Erro individual por NF-e/contato/produto**: cada item e processado em um SAVEPOINT (`db.begin_nested()`), isolando falhas sem afetar os demais no batch
 - **Erro geral do pipeline**: rollback completo, registra erro na tabela `etl_controle`
 - **Rate limit Bling (429)**: retry automatico com backoff exponencial (tenacity: 5 tentativas, 2-30s)
 - **Delay entre requests**: 0.35s entre cada chamada para respeitar o rate limit da API
 - **Itens duplicados**: quando uma NF-e tem o mesmo produto em linhas diferentes, os itens sao agrupados (quantidades e valores somados) antes do INSERT
+- **Token refresh inteligente**: so renova o token quando faltam menos de 10 minutos para expirar, evitando refreshes desnecessarios e consumo de rate limit
 
 ### Rate limit e retry
 
@@ -301,14 +304,21 @@ status: running | success | error
 | Tabela | PK | Registros* | Descricao |
 |--------|----|-----------|-----------|
 | `oauth_tokens` | `id=1` (fixo) | 1 | Token OAuth atual (sempre 1 registro, upsert) |
-| `nfe_cabecalho` | `id` (Bling) | ~2.677 | Cabecalho das NF-e de saida |
-| `nfe_itens` | `id` (serial) | ~5.473 | Itens de cada NF-e (FK → nfe_cabecalho) |
-| `nfe_pagamentos` | `id` (serial) | ~2.434 | Formas de pagamento (FK → nfe_cabecalho) |
-| `contatos` | `id` (Bling) | ~1.396 | Clientes/fornecedores referenciados nas NF-e |
-| `produtos` | `id` (Bling) | ~1.025 | Produtos referenciados nos itens das NF-e |
+| `nfe_cabecalho` | `id` (Bling) | ~2.850 | Cabecalho das NF-e de saida |
+| `nfe_itens` | `id` (serial) | ~5.848 | Itens de cada NF-e (FK → nfe_cabecalho) |
+| `nfe_pagamentos` | `id` (serial) | ~2.850 | Formas de pagamento (FK → nfe_cabecalho) |
+| `contatos` | `id` (Bling) | ~1.418 | Clientes/fornecedores referenciados nas NF-e |
+| `produtos` | `id` (Bling) | ~1.039 | Produtos referenciados nos itens das NF-e |
 | `etl_controle` | `id` (serial) | variavel | Log de cada execucao do pipeline |
 
-*Numeros referentes a carga historica 2021-2026.*
+*Numeros referentes a carga historica 2021-2026 (fev/2026).*
+
+### Notas sobre a API Bling
+
+- A API retorna apenas NF-e autorizadas (`situacao=6`) na listagem padrao com `tipo=1`
+- NF-e canceladas (`situacao=2`) nao sao retornadas — precisam ser consultadas com o filtro `situacao=2`
+- O limite maximo por pagina e 100 registros (a API rejeita valores maiores)
+- A API pode retornar mais de 100 itens por pagina e duplicatas entre paginas (bug do Bling) — o pipeline trata via upsert
 
 ### Estrategia de persistencia
 
@@ -452,7 +462,7 @@ Para popular o banco com dados retroativos, usar o endpoint `/run/full`.
 
 ### Recomendacoes
 
-- **Fatiar por ano** para evitar timeout (cada ano leva 2-15 min dependendo do volume)
+- Usar `POST /run` (sem split mensal) por ano — o `/run/full` quebra em periodos mensais e a API do Bling pode omitir NF-e nas bordas dos meses
 - O pipeline usa **upsert**, entao re-executar e seguro (nao duplica dados)
 - Respeitar o rate limit do Bling — aguardar 3-5 minutos entre fatias se receber 429
 
@@ -462,32 +472,33 @@ Para popular o banco com dados retroativos, usar o endpoint `/run/full`.
 SERVICE_URL="https://sol-bling-collector-838831242440.us-central1.run.app"
 TOKEN=$(gcloud auth print-identity-token)
 
-# Ano a ano
+# Ano a ano (usar /run em vez de /run/full para evitar perda por split mensal)
 for ANO in 2021 2022 2023 2024 2025; do
   echo "=== $ANO ==="
   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-    "$SERVICE_URL/run/full?data_inicio=$ANO-01-01&data_fim=$ANO-12-31"
+    "$SERVICE_URL/run?data_inicio=$ANO-01-01&data_fim=$ANO-12-31"
   echo ""
   sleep 300  # 5 min entre fatias (rate limit)
 done
 
 # 2026 ate hoje
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-  "$SERVICE_URL/run/full?data_inicio=2026-01-01"
+  "$SERVICE_URL/run?data_inicio=2026-01-01"
 ```
 
 ### Volumes da carga historica (referencia)
 
-| Ano | NF-e | Contatos | Produtos | Tempo |
-|-----|------|----------|----------|-------|
-| 2021 | 140 | 0-39 | 0-91 | ~2 min |
-| 2022 | 174 | 0-20 | 0-73 | ~7 min |
-| 2023 | 375 | 0-156 | 0-212 | ~3 min |
-| 2024 | 771 | 12-442 | 8-266 | ~5-15 min |
-| 2025 | 1.138 | 382 | 184 | ~11 min |
-| 2026 (jan-fev) | 161 | 0-90 | 0-38 | ~2 min |
+| Ano | Dashboard Bling | NF-e coletadas | Canceladas (nao coletadas) |
+|-----|----------------|----------------|---------------------------|
+| 2021 | 147 | 147 | 0 |
+| 2022 | 186 | 178 | 8 |
+| 2023 | 402 | 389 | 13 |
+| 2024 | 820 | 792 | 28 |
+| 2025 | 1.200 | 1.175 | 25 |
+| 2026 (jan-fev) | 171 | 169 | 2 |
+| **Total** | **2.926** | **2.850** | **76** |
 
-*Os ranges nos contatos/produtos dependem da ordem de execucao (as primeiras fatias carregam mais cadastros novos).*
+*A API do Bling nao retorna NF-e canceladas (situacao=2) na listagem padrao. As NF-e "faltantes" em relacao ao dashboard sao exclusivamente canceladas.*
 
 ---
 
