@@ -76,7 +76,19 @@ def upsert_nfe_itens(db: Session, nfe_id: int, itens: list[dict]) -> None:
     if itens:
         for item in itens:
             item["nfe_id"] = nfe_id
-        db.execute(pg_insert(NfeItem).values(itens))
+        stmt = pg_insert(NfeItem).values(itens)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_nfe_item",
+            set_={
+                "descricao_produto": stmt.excluded.descricao_produto,
+                "quantidade": NfeItem.quantidade + stmt.excluded.quantidade,
+                "valor_unitario": stmt.excluded.valor_unitario,
+                "valor_total": NfeItem.valor_total + stmt.excluded.valor_total,
+                "valor_desconto": NfeItem.valor_desconto + stmt.excluded.valor_desconto,
+                "unidade_medida": stmt.excluded.unidade_medida,
+            },
+        )
+        db.execute(stmt)
     logger.debug("NF-e %d: %d itens substituídos", nfe_id, len(itens))
 
 
