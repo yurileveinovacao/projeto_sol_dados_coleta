@@ -74,21 +74,18 @@ def upsert_nfe_cabecalho(db: Session, data: dict) -> int:
 def upsert_nfe_itens(db: Session, nfe_id: int, itens: list[dict]) -> None:
     db.execute(delete(NfeItem).where(NfeItem.nfe_id == nfe_id))
     if itens:
+        # Agrupar itens duplicados (mesmo codigo_produto na mesma NF-e)
+        agrupados: dict[str | None, dict] = {}
         for item in itens:
             item["nfe_id"] = nfe_id
-        stmt = pg_insert(NfeItem).values(itens)
-        stmt = stmt.on_conflict_do_update(
-            constraint="uq_nfe_item",
-            set_={
-                "descricao_produto": stmt.excluded.descricao_produto,
-                "quantidade": NfeItem.quantidade + stmt.excluded.quantidade,
-                "valor_unitario": stmt.excluded.valor_unitario,
-                "valor_total": NfeItem.valor_total + stmt.excluded.valor_total,
-                "valor_desconto": NfeItem.valor_desconto + stmt.excluded.valor_desconto,
-                "unidade_medida": stmt.excluded.unidade_medida,
-            },
-        )
-        db.execute(stmt)
+            chave = item.get("codigo_produto")
+            if chave in agrupados:
+                agrupados[chave]["quantidade"] += item.get("quantidade", 0)
+                agrupados[chave]["valor_total"] += item.get("valor_total", 0)
+                agrupados[chave]["valor_desconto"] += item.get("valor_desconto", 0)
+            else:
+                agrupados[chave] = dict(item)
+        db.execute(pg_insert(NfeItem).values(list(agrupados.values())))
     logger.debug("NF-e %d: %d itens substituídos", nfe_id, len(itens))
 
 
